@@ -146,7 +146,8 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
                                           const torch::Tensor& block_table,
                                           const torch::Tensor& schedule_meta,
                                           const int& max_context_len,
-                                          const bool& clean_logits) {
+                                          const bool& clean_logits,
+                                          const std::optional<torch::Tensor>& out = std::nullopt) {
     const auto& [batch_size, next_n, num_heads, head_dim] = get_shape<4>(q);
     const auto& [num_kv_blocks, block_kv, num_heads_kv, head_dim_with_sf] = get_shape<4>(fused_kv_cache);
     const auto& [batch_size_] = get_shape<1>(context_lens);
@@ -197,10 +198,31 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
         torch::TensorOptions().dtype(torch::kFloat32)
     );
 
-    // Allocate output
+    // Allocate output, or adopt a caller-provided persistent buffer. A fresh
+    // allocation per call pins one `[batch_size * next_n, aligned_max_context_len]`
+    // float tensor per invocation into the memory pool during CUDA graph
+    // capture (frees are deferred while capturing), so a many-layer captured
+    // model accumulates one logits-sized block per layer. Passing `out` lets
+    // the caller reuse a single buffer across layers; the kernel only needs
+    // the row stride to be `num_math_warp_groups * block_kv`-aligned.
     constexpr int num_math_warp_groups = 4;
     const auto& aligned_max_context_len = align(max_context_len, num_math_warp_groups * block_kv);
-    auto logits = torch::empty({batch_size * next_n, aligned_max_context_len}, q.options().dtype(torch::kFloat));
+    auto logits_stride = aligned_max_context_len;
+    torch::Tensor logits;
+    if (out.has_value()) {
+        const auto& buf = out.value();
+        DG_HOST_ASSERT(buf.scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(buf.dim() == 2);
+        DG_HOST_ASSERT(buf.stride(1) == 1);
+        DG_HOST_ASSERT(buf.size(1) == buf.stride(0));
+        DG_HOST_ASSERT(buf.size(0) >= batch_size * next_n);
+        DG_HOST_ASSERT(buf.stride(0) >= aligned_max_context_len);
+        DG_HOST_ASSERT(buf.stride(0) % (num_math_warp_groups * block_kv) == 0);
+        logits_stride = static_cast<int>(buf.stride(0));
+        logits = buf.slice(0, 0, batch_size * next_n);
+    } else {
+        logits = torch::empty({batch_size * next_n, aligned_max_context_len}, q.options().dtype(torch::kFloat));
+    }
     logits = logits.slice(-1, 0, max_context_len);
 
     // Dispatch implementation
@@ -208,14 +230,14 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
     if (arch_major == 9 or arch_major == 10) {
         smxx_fp8_paged_mqa_logits(q, kv_cache, kv_cache_scales, weights, context_lens, logits, block_table, schedule_meta,
                                   batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv,
-                                  kv_cache_stride_bytes, aligned_max_context_len, block_table_stride, num_sms, num_math_warp_groups);
+                                  kv_cache_stride_bytes, logits_stride, block_table_stride, num_sms, num_math_warp_groups);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
 
     // Clean unfilled logits
     if (clean_logits)
-        smxx_clean_logits(logits, std::nullopt, context_lens, next_n, batch_size * next_n, max_context_len, aligned_max_context_len);
+        smxx_clean_logits(logits, std::nullopt, context_lens, next_n, batch_size * next_n, max_context_len, logits_stride);
     return logits;
 }
 
@@ -234,7 +256,8 @@ static void register_apis(pybind11::module_& m) {
     m.def("fp8_paged_mqa_logits", &fp8_paged_mqa_logits,
           py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
           py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),
-          py::arg("max_context_len"), py::arg("clean_logits") = false);
+          py::arg("max_context_len"), py::arg("clean_logits") = false,
+          py::arg("out") = std::nullopt);
 }
 
 } // namespace deep_gemm::attention
