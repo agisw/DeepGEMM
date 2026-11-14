@@ -19,6 +19,7 @@ from ._C import (
     get_num_sms,
     set_tc_util,
     get_tc_util,
+    clear_kernel_runtime_cache,
 )
 
 # cuBLASLt Kernels

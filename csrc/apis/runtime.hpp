@@ -20,6 +20,11 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_tc_util", [&]() {
         return device_runtime->get_tc_util();
     });
+    m.def("clear_kernel_runtime_cache", [&]() {
+#if DG_TENSORMAP_COMPATIBLE
+        kernel_runtime_cache->clear();
+#endif
+    });
     m.def("init", [&](const std::string& library_root_path, const std::string& cuda_home_path_by_python) {
 #if DG_TENSORMAP_COMPATIBLE
         Compiler::prepare_init(library_root_path, cuda_home_path_by_python);

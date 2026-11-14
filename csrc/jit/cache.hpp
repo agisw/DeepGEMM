@@ -24,6 +24,12 @@ public:
             return cache[dir_path] = std::make_shared<KernelRuntime>(dir_path);
         return nullptr;
     }
+
+    // Drop every cached runtime. Each KernelRuntime unloads its CUDA library on
+    // destruction, so this must run while the CUDA context is still alive.
+    void clear() {
+        cache.clear();
+    }
 };
 
 static auto kernel_runtime_cache = std::make_shared<KernelRuntimeCache>();
